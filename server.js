@@ -52,16 +52,51 @@ function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
 
-// Generic in-memory "collection" — mimics just enough of the
-// Firestore API surface the original controllers relied on.
+// ============================================================
+// FIRESTORE — optional. If FIREBASE_SERVICE_ACCOUNT is set, all
+// writes are persisted to Firestore in the background, and data
+// is loaded ("hydrated") from Firestore on startup. If it's not
+// set, the app behaves exactly as before (in-memory only).
+// ============================================================
+let firestore = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const admin = require('firebase-admin');
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    }
+    firestore = admin.firestore();
+    console.log('[firestore] connected — data will persist across restarts.');
+  } else {
+    console.warn('[firestore] FIREBASE_SERVICE_ACCOUNT not set — running with in-memory data only (resets on restart).');
+  }
+} catch (err) {
+  console.error('[firestore] failed to initialize, falling back to in-memory only:', err.message);
+  firestore = null;
+}
+
+// Generic "collection" — mimics just enough of the Firestore API
+// surface the original controllers relied on. Reads/writes are
+// synchronous against an in-memory Map (so no route code needs to
+// change), while writes are also persisted to Firestore in the
+// background when it's configured.
 function makeCollection(name) {
   const rows = new Map(); // id -> data
   let seq = 1;
+
+  function persist(id, data) {
+    if (!firestore) return;
+    firestore.collection(name).doc(id).set(data, { merge: true })
+      .catch(err => console.error(`[firestore] failed to save ${name}/${id}:`, err.message));
+  }
+
   return {
     name,
     add(data) {
       const id = String(seq++);
       rows.set(id, { ...data });
+      persist(id, rows.get(id));
       return { id, ...rows.get(id) };
     },
     get(id) {
@@ -70,6 +105,7 @@ function makeCollection(name) {
     update(id, patch) {
       if (!rows.has(id)) return null;
       rows.set(id, { ...rows.get(id), ...patch });
+      persist(id, rows.get(id));
       return { id, ...rows.get(id) };
     },
     increment(id, field, by = 1) {
@@ -77,6 +113,7 @@ function makeCollection(name) {
       const cur = rows.get(id);
       const next = { ...cur, [field]: (cur[field] || 0) + by };
       rows.set(id, next);
+      persist(id, next);
       return { id, ...next };
     },
     all() {
@@ -84,6 +121,18 @@ function makeCollection(name) {
     },
     where(pred) {
       return this.all().filter(pred);
+    },
+    // Loads existing documents from Firestore into memory. Called
+    // once at startup, before the server starts accepting traffic.
+    async hydrate() {
+      if (!firestore) return;
+      const snap = await firestore.collection(name).get();
+      snap.forEach(doc => {
+        rows.set(doc.id, doc.data());
+        const n = parseInt(doc.id, 10);
+        if (!isNaN(n) && n >= seq) seq = n + 1;
+      });
+      if (snap.size > 0) console.log(`[firestore] loaded ${snap.size} ${name} from Firestore`);
     },
   };
 }
@@ -523,9 +572,23 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   res.status(status).json({ error: err.message || 'Internal server error' });
 });
 
-seed();
+async function start() {
+  // Load any existing data from Firestore (no-op if not configured).
+  for (const key of Object.keys(db)) {
+    await db[key].hydrate();
+  }
+  // Only seed demo data the very first time (i.e. Firestore/memory is empty).
+  if (db.users.all().length === 0) {
+    seed();
+    console.log('Seeded demo data.');
+  } else {
+    console.log('Loaded existing data — skipped seeding.');
+  }
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`Pasumai Tech (frontend + API) listening on http://localhost:${PORT}`);
-});
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => {
+    console.log(`Pasumai Tech (frontend + API) listening on http://localhost:${PORT}`);
+  });
+}
+
+start();
